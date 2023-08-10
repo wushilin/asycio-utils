@@ -1,9 +1,9 @@
 [package]
 name = "asyncio-utils"
-version = "0.4.1"
+version = "0.4.3"
 edition = "2021"
 license = "Apache-2.0"
-
+description = "Support limit,skip on AsyncRead traits"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]

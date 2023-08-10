@@ -2,27 +2,203 @@ use tokio::io::{AsyncRead, AsyncSeek, SeekFrom, AsyncSeekExt, AsyncReadExt, Asyn
 use std::pin::Pin;
 use core::task::Poll;
 use tokio::io::ReadBuf;
-// Undo reader supports unread(&[u8])
-// Useful when you are doing serialization/deserialization where you 
-// need to put data back (undo the read)
-// You can use UndoReader as if it is a normal AsyncRead
-// Additionally, UndoReader supports a limit as well. It would stop reading after limit is reached (EOF)
+use std::error::Error;
+use std::io::Read;
+use std::io::Write;
 
-// Example:
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub enum ObserverDecision {
+    Continue,
+    Abort,
+}
+/// Observe a stream's operation when user code is not involved.
+/// For example: When you call EhRead.stream_to function, and you may want to calculate
+/// the checksum (SHA1, SHA256 or MD5 along the way, you can observe the stream copy using the observer)
+pub trait StreamObserver {
+    /// Your observer's begin will be called before stream copy
+    /// If you plan to reuse the observer, you can reset it here
+    fn begin(&mut self) {
+        // Default initialize does nothing
+    }
+
+    /// Before the upstream is read. If you want to abort, abort it here by
+    /// overriding the before_read()
+    fn before_read(&mut self) -> ObserverDecision {
+        return ObserverDecision::Continue;
+    }
+    /// A chunk of data had been read from upstream, about to be written now
+    /// You can intercept it by aborting it here
+    fn before_write(&mut self, _: &[u8]) -> ObserverDecision {
+        return ObserverDecision::Continue;
+    }
+
+    /// A chunk of data had been written to down stream.
+    /// You can intercept it by aborting it here
+    fn after_write(&mut self, _:&[u8]) -> ObserverDecision {
+        return ObserverDecision::Continue;
+    }
+
+    /// The copy ended and `size` bytes had been copied
+    /// If there is error, err with be Some(cause)
+    /// Note, different from Result<usize, Box<dyn Error>>, the bytes copied is always given
+    /// Even if it is zero
+    fn end(&mut self, _:usize, _:Option<Box<&dyn Error>>) {
+
+    }
+}
+
+struct DumbObserver;
+impl StreamObserver for DumbObserver {
+}
+/// Enhanced Reader for std::io::Read
+/// It provides convenient methods for exact reading without throwing error
+/// It allow you to send it to writer
+pub trait EhRead:Read {
+    /// Try to fully read to fill the buffer, similar to read_exact, 
+    /// However, this method never throw errors on error on EOF.
+    /// On EOF, it also returns Ok(size) but size might be smaller than available buffer.
+    /// When size is smaller than buffer size, it must be EOF.
+    /// 
+    /// Upon EOF, you may read again, but you will get EOF anyway with the EOF error.
+    fn try_read_exact(&mut self, buffer: &mut [u8]) -> Result<usize, Box<dyn Error>> {
+        let wanted = buffer.len();
+        let mut copied:usize = 0;
+
+        loop {
+            let rr = self.read(&mut buffer[copied..])?;
+            if rr == 0 {
+                // EOF reached, return copied bytes so far. 
+                // Caller upon seeing result shorter than expected can either:
+                // a) declare EOF
+                // b) call try_read_exact again but receive 0 bytes as result
+                return Ok(copied);
+            }
+            copied = copied + rr;
+            if copied >= wanted {
+                return Ok(copied);
+            }
+        }
+    }
+
+
+    /// Skip bytes from the reader. Return the actual size skipped or the error.
+    /// If EOF reached before skip is complete, UnexpectedEOF error is returned.
+    /// On success, the size must be equal to the input bytes
+    fn skip(&mut self, bytes: usize) -> Result<usize, Box<dyn Error>> {
+        if bytes == 0 {
+            return Ok(0);
+        }
+        let mut buffer = [0u8; 4096];
+        let mut remaining = bytes;
+        while remaining > 0 {
+            let rr = self.try_read_exact(&mut buffer[..remaining])?;
+            if rr == 0 {
+                // EOF reached
+                return Err(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "Insufficient bytes to skip").into());
+            }
+            remaining -= rr;
+        }
+        Ok(bytes)
+    }
+
+    /// Copy all content until EOF to Write. 
+    /// Using buffer_size buffer. If not given, 4096 is used.
+    /// If buffer_size is Some(0), 4096 is used
+    /// 
+    /// Return the number of bytes copied, or any error encountered. 
+    /// 
+    /// If error is EOF, then error is not returned and size would be 0.
+    fn stream_to<W>(&mut self, w:&mut W, buffer_size:Option<usize>, observer:Option<Box<dyn StreamObserver>>) -> Result<usize, Box<dyn Error>> 
+        where W:Write + Sized
+    {
+        let mut buffer_size = buffer_size.unwrap_or(4096);
+        if buffer_size == 0 {
+            buffer_size = 4096;
+        }
+        let mut buffer = vec![0u8; buffer_size];
+        return self.stream_to_with_buffer(w, &mut buffer, observer);
+    }
+
+    /// Same as stream_to, but use externally provided buffer
+    fn stream_to_with_buffer<W>(&mut self, w:&mut W, buffer:&mut[u8], observer:Option<Box<dyn StreamObserver>>) -> Result<usize, Box<dyn Error>>
+        where W:Write+Sized {
+        let mut observer = observer;
+        let default_ob: Box<dyn StreamObserver> = Box::new(DumbObserver);
+        let mut obs = observer.take().unwrap_or(default_ob);
+        let mut copied:usize = 0;
+        loop {
+            let decision = obs.before_read();
+            if decision == ObserverDecision::Abort {
+                break;
+            }
+            let rr = self.read(buffer);
+            if rr.is_err() {
+                let err = rr.err().unwrap();
+                obs.end(copied, Some(Box::new(&err)));
+                return Err(err.into());
+            }
+            let rr = rr.unwrap();
+            if rr == 0 {
+                // EOF
+                break;
+            }
+            let decision = obs.before_write(&buffer[0..rr]);
+            if decision == ObserverDecision::Abort {
+                break;
+            }
+            let wr = w.write_all(&buffer[0..rr]);
+            if wr.is_err() {
+                let err = wr.err().unwrap();
+                obs.end(copied, Some(Box::new(&err)));
+                return Err(err.into());
+            }
+            let decision = obs.after_write(&buffer[0..rr]);
+            if decision == ObserverDecision::Abort {
+                break;
+            }
+            copied += rr;
+        }
+        return Ok(copied);
+    }
+
+
+}
+
+
+/// Blanked implementation for EhRead for all Read for free
+/// 
+/// You can use EhRead functions on all Read's implementations as long as 
+/// you use this library and import EhRead trait.
+impl <T> EhRead for T where T:Read{}
+/// Undo reader supports unread(&[u8])
+/// Useful when you are doing serialization/deserialization where you 
+/// need to put data back (undo the read)
+/// You can use UndoReader as if it is a normal AsyncRead
+/// Additionally, UndoReader supports a limit as well. It would stop reading after limit is reached (EOF)
+
+/// Example:
 /// ```
 /// // You can have rust code between fences inside the comments
 /// // If you pass --test to `rustdoc`, it will even test it for you!
-/// use asyncio_utils::UndoReader;
-/// let input = tokio::fs::File::open("test.data").unwrap();
-/// let first_10_bytes_reader = UndoReader::wrap(input, Some(10)); // limit to first 10 bytes, EOF afterwards
-/// let my_data = first_10_bytes_reader.read(buf).await?;
-/// // use my_data
-/// 
-/// let read_every_thing = UndoReader::wrap(input, None); // No limit (usize::max actually)
-/// 
-/// first_10_bytes_reader.unread(&my_data[4..7]); // Put back the 3 bytes back to the undo reader
-/// 
-/// first_10_bytes_reader.read(&mut buf); // definitely will be the 3 bytes you put back just now. Unless your buffer is too small
+/// async fn do_test() -> Result<(), Box<dyn std::error::Error>> {
+///     use tokio::io::{AsyncRead,AsyncSeek,AsyncReadExt, AsyncSeekExt};
+///     let f = tokio::fs::File::open("input.txt").await?;
+///     let mut my_undo = crate::asyncio_utils::UndoReader::new(f, Some(10)); // only read 10 bytes
+///     let mut buff = vec![0u8; 10];
+///     let read_count = my_undo.read(&mut buff).await?;
+///     if read_count > 0 {
+///         // inspect the data read check if it is ok
+///         my_undo.unread(&mut buff[0..read_count]); // put all bytes back
+///     }
+///     let data = "XYZ".as_bytes();
+///     my_undo.unread(&data);
+///     // this should be 3 (the "XYZ" should be read here)
+///     let second_read_count = my_undo.read(&mut buff).await?;
+///     // this should be equal to read_count because it would have been reread here
+///     let third_read_count = my_undo.read(&mut buff).await?;
+///     // ...
+///     Ok(())
+/// }
 /// ```
 pub struct UndoReader<T>
     where T:AsyncRead + Unpin
@@ -42,7 +218,13 @@ impl<T> UndoReader<T>
     /// Example:
     /// ```
     /// // initialize my_undo
-    /// let (remaining, raw) = my_undo.destruct();
+    /// async fn do_test() -> Result<(), Box<dyn std::error::Error>> {
+    ///     let f = tokio::fs::File::open("input.txt").await?;
+    ///     let my_undo = crate::asyncio_utils::UndoReader::new(f, None);
+    ///     let (remaining, raw) = my_undo.destruct();
+    ///     // ...
+    ///     Ok(())
+    /// }
     /// // remaining is the bytes to be consumed.
     /// // raw is the raw AsyncRead
     /// ```
@@ -118,6 +300,7 @@ impl<T> UndoReader<T>
     }
 }
 
+
 /// Implementation of AsyncRead for UndoReader
 impl<T> AsyncRead for UndoReader<T>
     where T:AsyncRead + Unpin
@@ -177,6 +360,26 @@ impl<T> AsyncRead for UndoReader<T>
 }
 
 
+/// An AsyncRead + AsyncSeek wrapper
+/// It supports limit the bytes can be read.
+/// Typically used when you want to read a specific segments from a file
+/// 
+/// Example
+/// ```
+/// 
+/// async fn run_test() -> Result<(), Box<dyn std::error::Error>> {
+///     use tokio::io::SeekFrom;
+///     use tokio::io::{AsyncRead,AsyncSeek, AsyncReadExt, AsyncSeekExt};
+///     let f = tokio::fs::File::open("input.txt").await?;
+///     let read_from: u64 = 18; // start read from 18'th byte
+///     let mut lsr = crate::asyncio_utils::LimitSeekerReader::new(f, Some(20)); // read up to 20 bytes
+///     lsr.seek(SeekFrom::Start(read_from)); // do seek
+/// 
+///     let mut buf = vec![0u8; 1024];
+///     lsr.read(&mut buf); // read it
+///     return Ok(());
+/// }
+/// ```
 pub struct LimitSeekerReader<T>
     where T:AsyncRead + AsyncSeek + Unpin
 {
@@ -202,6 +405,14 @@ pub struct LimitSeekerReader<T>
 impl<T> LimitSeekerReader<T>
     where T:AsyncRead + AsyncSeek + Unpin
 {
+    /// Destruct the LimitSeekerReader and get the bytes read so far and the original reader
+    /// Returns the size read and the original reader. 
+    /// 
+    /// You can't use the LimitSeekerReader after this call
+    pub fn destruct(self) -> (usize, T) {
+        (self.read_count, self.src)
+    }
+
     /// Create new LimitSeekerReader from another AsyncRead + AsyncSeek (typically file)
     /// 
     /// Argument src is the underlying reader + seeker
@@ -275,6 +486,18 @@ impl<T> AsyncSeek for LimitSeekerReader<T>
 /// Useful when you want to read stream but want to end early no matter what
 /// 
 /// E.g. you can't accept more than 20MiB as HTTP Post body, you can limit it here
+/// Example:
+/// ```
+/// async fn do_test() -> Result<(), Box<dyn std::error::Error>> {
+///     use tokio::io::{AsyncReadExt};
+///     let mut f = tokio::fs::File::open("input.txt").await?;
+///     let mut reader = crate::asyncio_utils::LimitReader::new(f, Some(18)); // only read at most 18 bytes
+/// 
+///     let mut buf = vec![0u8; 2096];
+///     reader.read(&mut buf).await?;
+///     return Ok(());
+/// }
+/// ```
 pub struct LimitReader<T>
     where T:AsyncRead + Unpin
 {
@@ -284,6 +507,7 @@ pub struct LimitReader<T>
 }
 
 
+/// Implementation of AysncRead for LimitReader
 impl<T> LimitReader<T>
     where T:AsyncRead + Unpin
 {
@@ -304,6 +528,13 @@ impl<T> LimitReader<T>
             },
             read_count: 0
         }
+    }
+
+    /// Destruct the LimitReader and get the total read bytes and the original reader
+    /// 
+    /// Takes the ownership and You can't use the LimitReader after this call
+    pub fn destruct(self) -> (usize, T) {
+        (self.read_count, self.src)
     }
 }
 
